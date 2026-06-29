@@ -10,9 +10,7 @@ through track timeout management.
 Architecture:
     List<Person> → Track Extraction → Track Update → Track Timeout → Count
 
-Author: System Architect
-Version: 2.2.0 (FINAL - Locked)
-"""
+ """
 
 from __future__ import annotations
 

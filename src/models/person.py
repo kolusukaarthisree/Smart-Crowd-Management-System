@@ -3,10 +3,7 @@ person.py - Person Entity Module
 
 This module defines the Person class representing a tracked individual
 in the people counting and occupancy monitoring system.
-
-Author: System Architect
-Version: 1.0.0
-"""
+ """
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List

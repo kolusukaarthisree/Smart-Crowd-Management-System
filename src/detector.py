@@ -12,10 +12,7 @@ our domain objects (Person).
 
 Architecture:
     Camera Frame → YOLO → ByteTrack → Results → Person Objects
-
-Author: System Architect
-Version: 2.3.0 (FINAL - Locked)
-"""
+ """
 
 from __future__ import annotations
 
