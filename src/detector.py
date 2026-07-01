@@ -56,7 +56,7 @@ class DetectorConfig:
     device: str = "cpu"
     image_size: int = 640
     max_detections: int = 100
-    tracker_config: str = "bytetrack.yaml"
+    tracker_config: str = "config/bytetrack.yaml"
     person_class_id: int = 0
     half_precision: bool = False
     verbose: bool = False

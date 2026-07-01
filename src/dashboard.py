@@ -1,690 +1,539 @@
 """
-dashboard.py - Dashboard Module
+Smart Crowd Management System — Dashboard (HMI)
 
-This module is the PURE RENDERING LAYER of the Smart Crowd Management System.
-It has exactly ONE responsibility:
+A pure presentation layer built with Tkinter + OpenCV.
+It performs NO analytics, detection, counting, risk evaluation, or logging.
+It only renders state objects produced by the backend and draws bounding
+boxes / track IDs on the live camera feed.
 
-    Render all system state onto the camera frame.
+Design philosophy: Minimal. Professional. Operational.
+Theme: charcoal + amber.
 
-The dashboard does NOT calculate anything. It only consumes outputs from
-other modules and draws them on the frame.
+Public API
+----------
+    dashboard = Dashboard()
+    dashboard.run()                         # blocks; shows startup screen first
+    # From the backend loop, on every new frame:
+    dashboard.update(
+        frame=bgr_ndarray,
+        people=[Person(...), ...],
+        counter=CounterState(...),
+        occupancy=OccupancyState(...),
+        risk=RiskState(...),
+        alert=AlertState(...),
+        camera=CameraHealth(...),
+        perf=PerformanceMetrics(...),
+    )
 
-Architecture:
-    frame + people + counter_state + occupancy_state + risk_state + alert_state
-                                    ↓
-                              Dashboard
-                                    ↓
-                           Annotated Frame
-
-Author: System Architect
-Version: 2.1.0 (FINAL - Locked)
+All state dataclasses below are duck-typed: the dashboard only reads the
+attributes it documents. Backend modules may supply their own equivalent
+objects as long as the attribute names match.
 """
 
 from __future__ import annotations
 
-import cv2
+import time
+import tkinter as tk
+from dataclasses import dataclass, field
+from queue import Empty, Queue
+from tkinter import ttk
+from typing import Iterable, Optional, Sequence
+
 import numpy as np
-from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
 
-from .models.person import Person
-from .counter import CounterState
-from .occupancy import OccupancyState
-from .risk import RiskState, RiskLevel
-from .alerts import AlertState
+try:
+    import cv2  # type: ignore
+except ImportError:  # pragma: no cover
+    cv2 = None
 
-
-# ============================================================================
-# Professional Surveillance Color Palette
-# ============================================================================
-
-class Colors:
-    """
-    Professional surveillance color palette.
-    
-    Design Philosophy:
-        - 95% grayscale for backgrounds and text
-        - 5% color for accents and alerts
-        - Orange as primary accent (industrial monitoring feel)
-        - No blue (avoids enterprise SaaS look)
-        - Risk: Gray → Amber → Orange → Red
-        - Bounding boxes: Soft green (always)
-    """
-    
-    # Backgrounds (Grayscale)
-    BACKGROUND = (22, 22, 22)           # Very Dark Gray (#1A1A1A)
-    PANEL = (35, 35, 35)                # Slightly lighter (#252525)
-    PANEL_DARK = (28, 28, 28)           # Darker panel (#1C1C1C)
-    PANEL_LIGHT = (45, 45, 45)          # Lighter panel (#2D2D2D)
-    HEADER = (28, 28, 30)               # Header background (#1C1C1E)
-    
-    # Borders
-    BORDER = (60, 60, 60)               # Subtle borders (#3C3C3C)
-    BORDER_ACCENT = (0, 120, 200)       # Orange accent border (slightly darker)
-    
-    # Text
-    TEXT_PRIMARY = (255, 255, 255)      # White
-    TEXT_SECONDARY = (190, 190, 190)    # Light Gray (#BEBEBE)
-    TEXT_MUTED = (130, 130, 130)        # Medium Gray (#828282)
-    TEXT_DIM = (80, 80, 80)             # Dim Gray (#505050)
-    
-    # Accent Colors (Orange theme - softer, more premium)
-    ACCENT = (0, 150, 235)              # Soft Orange (#FF9610)
-    ACCENT_DIM = (0, 110, 185)          # Dim Orange
-    ACCENT_DARK = (0, 70, 130)          # Dark Orange
-    
-    # Risk Colors (Gray → Amber → Orange → Red)
-    RISK_NORMAL = (130, 130, 130)       # Gray - No attention needed
-    RISK_ELEVATED = (0, 200, 255)       # Amber (#FFC800)
-    RISK_HIGH = (0, 140, 255)           # Orange (#FF8C00)
-    RISK_CRITICAL = (0, 0, 255)         # Red (#FF0000)
-    
-    # Bounding Boxes (Soft Green - easier on the eyes)
-    BOX_GREEN = (60, 180, 75)           # Soft green (#4BB44B)
-    BOX_GREEN_DIM = (30, 90, 38)        # Dim green for inactive
-    
-    # Status Indicators
-    STATUS_ONLINE = (0, 200, 0)         # Green
-    STATUS_OFFLINE = (0, 0, 255)        # Red
-    STATUS_WARNING = (0, 200, 255)      # Amber
-    
-    # Alerts
-    ALERT_INFO = (190, 190, 190)        # Gray
-    ALERT_WARNING = (0, 200, 255)       # Amber
-    ALERT_HIGH = (0, 140, 255)          # Orange
-    ALERT_CRITICAL = (0, 0, 255)        # Red
-    
-    @classmethod
-    def get_risk_color(cls, risk_level: RiskLevel) -> Tuple[int, int, int]:
-        """Get color for risk level."""
-        if risk_level == RiskLevel.NORMAL:
-            return cls.RISK_NORMAL
-        elif risk_level == RiskLevel.ELEVATED:
-            return cls.RISK_ELEVATED
-        elif risk_level == RiskLevel.HIGH:
-            return cls.RISK_HIGH
-        elif risk_level == RiskLevel.CRITICAL:
-            return cls.RISK_CRITICAL
-        return cls.RISK_NORMAL
-    
-    @classmethod
-    def get_risk_text(cls, risk_level: RiskLevel) -> str:
-        """Get risk level text."""
-        return risk_level.value.upper()
+try:
+    from PIL import Image, ImageTk  # type: ignore
+except ImportError:  # pragma: no cover
+    Image = None
+    ImageTk = None
 
 
-# ============================================================================
-# Dashboard - Pure Rendering Layer
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# Theme
+# ─────────────────────────────────────────────────────────────────────────────
+
+BG          = "#181818"   # background — almost black
+PANEL       = "#232323"   # panels — dark gray
+ACCENT      = "#F5A623"   # amber
+TEXT        = "#EAEAEA"   # light gray
+TEXT_DIM    = "#8A8A8A"
+GREEN       = "#3FB950"
+AMBER       = "#F5A623"
+RED         = "#E5484D"
+GRAY        = "#5A5A5A"
+
+FONT_FAMILY = "Helvetica"
+F_TITLE     = (FONT_FAMILY, 14, "bold")
+F_LABEL     = (FONT_FAMILY, 9)
+F_METRIC    = (FONT_FAMILY, 28, "bold")
+F_SECTION   = (FONT_FAMILY, 10, "bold")
+F_BODY      = (FONT_FAMILY, 10)
+F_CLOCK     = (FONT_FAMILY, 12, "bold")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Duck-typed state objects (the backend may supply its own equivalents)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Person:
+    track_id: int
+    bbox: tuple                       # (x1, y1, x2, y2)
+    confidence: float = 0.0
+
+
+@dataclass
+class CounterState:
+    people: int = 0
+
+
+@dataclass
+class OccupancyState:
+    current: int = 0
+    capacity: int = 0
+    percent: float = 0.0
+
+
+@dataclass
+class RiskState:
+    level: str = "NORMAL"             # NORMAL | HIGH | CRITICAL
+
+
+@dataclass
+class AlertState:
+    active: int = 0
+    severity: str = "NORMAL"          # NORMAL | WARNING | CRITICAL
+    message: str = ""
+
+
+@dataclass
+class CameraHealth:
+    online: bool = True
+    quality: str = "GOOD"             # GOOD | BLUR | OFFLINE
+    resolution: tuple = (0, 0)
+
+
+@dataclass
+class PerformanceMetrics:
+    fps: float = 0.0
+    detector_ready: bool = True
+    tracker_ready: bool = True
+    logger_active: bool = True
+
+
+@dataclass
+class _Snapshot:
+    frame: object = None
+    people: Sequence[Person] = field(default_factory=list)
+    counter: CounterState = field(default_factory=CounterState)
+    occupancy: OccupancyState = field(default_factory=OccupancyState)
+    risk: RiskState = field(default_factory=RiskState)
+    alert: AlertState = field(default_factory=AlertState)
+    camera: CameraHealth = field(default_factory=CameraHealth)
+    perf: PerformanceMetrics = field(default_factory=PerformanceMetrics)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard
+# ─────────────────────────────────────────────────────────────────────────────
 
 class Dashboard:
-    """
-    Pure rendering layer for the Smart Crowd Management System.
-    
-    The dashboard has ZERO business logic. It only consumes state from
-    other modules and renders it on the frame.
-    
-    Inputs:
-        - frame: Camera frame
-        - people: List of Person objects
-        - counter_state: CounterState from Counter
-        - occupancy_state: OccupancyState from Occupancy
-        - risk_state: RiskState from Risk
-        - alert_state: AlertState from Alerts
-    
-    Output:
-        - Annotated frame with all visual elements
-    
-    Attributes:
-        frame_width: Width of the frame
-        frame_height: Height of the frame
-        show_fps: Whether to show FPS
-        show_frame_number: Whether to show frame number (debug)
-        recording: Whether recording is active
-        start_time: When the monitoring session started
-    """
-    
-    def __init__(
+    """Smart Crowd Management — operator HMI."""
+
+    def __init__(self) -> None:
+        self.venue_name: str = ""
+        self.max_capacity: int = 0
+
+        self._queue: "Queue[_Snapshot]" = Queue(maxsize=2)
+        self._latest: _Snapshot = _Snapshot()
+        self._photo = None              # keep ref so Tk doesn't GC the image
+        self._photo_refs = []          # retain recent PhotoImage objects
+        self._pulse_on = True
+
+        self.root = tk.Tk()
+        self.root.title("Smart Crowd Management System")
+        self.root.configure(bg=BG)
+        self.root.geometry("1280x800")
+        self.root.minsize(1100, 720)
+
+        self._monitoring = False
+        self._start_callback = None
+        self._build_startup()
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    def set_start_callback(self, callback) -> None:
+        """Set callback to be called when user clicks Start Monitoring."""
+        self._start_callback = callback
+
+    def update(
         self,
-        show_fps: bool = True,
-        show_frame_number: bool = False,
-        camera_name: str = "Camera 01"
+        frame=None,
+        people: Iterable[Person] = (),
+        counter: Optional[CounterState] = None,
+        occupancy: Optional[OccupancyState] = None,
+        risk: Optional[RiskState] = None,
+        alert: Optional[AlertState] = None,
+        camera: Optional[CameraHealth] = None,
+        perf: Optional[PerformanceMetrics] = None,
     ) -> None:
-        """
-        Initialize the dashboard.
-        
-        Args:
-            show_fps: Whether to show FPS counter
-            show_frame_number: Whether to show frame number (debug)
-            camera_name: Camera display name
-        """
-        self.show_fps = show_fps
-        self.show_frame_number = show_frame_number
-        self.camera_name = camera_name
-        self.recording = False
-        
-        self.frame_width = 0
-        self.frame_height = 0
-        self.fps = 0
-        self.frame_count = 0
-        self.start_time = datetime.now()
-    
-    def render(
-        self,
-        frame: np.ndarray,
-        people: List[Person],
-        counter_state: CounterState,
-        occupancy_state: OccupancyState,
-        risk_state: RiskState,
-        alert_state: AlertState,
-        fps: float = 0.0
-    ) -> np.ndarray:
-        """
-        Render all system state onto the frame.
-        
-        This is the MAIN ENTRY POINT of the dashboard.
-        
-        Args:
-            frame: Camera frame (BGR)
-            people: List of Person objects from Detector
-            counter_state: CounterState from Counter
-            occupancy_state: OccupancyState from Occupancy
-            risk_state: RiskState from Risk
-            alert_state: AlertState from Alerts
-            fps: Current FPS
-            
-        Returns:
-            Annotated frame
-        """
-        # Store frame dimensions
-        self.frame_height, self.frame_width = frame.shape[:2]
-        self.fps = fps
-        self.frame_count += 1
-        
-        # Create a copy to avoid modifying original
-        annotated = frame.copy()
-        
-        # Draw all elements (order matters for layering)
-        self._draw_bounding_boxes(annotated, people)
-        self._draw_header(annotated)
-        self._draw_analytics_bar(annotated, counter_state, occupancy_state, risk_state)
-        self._draw_alert_panel(annotated, alert_state)
-        self._draw_watermark(annotated)
-        self._draw_system_status(annotated)
-        self._draw_frame_debug(annotated)
-        
-        return annotated
-    
-    def _draw_bounding_boxes(self, frame: np.ndarray, people: List[Person]) -> None:
-        """
-        Draw bounding boxes with track IDs.
-        
-        Boxes are ALWAYS soft green - they represent tracked individuals,
-        not the crowd state. Risk is shown in the analytics bar.
-        """
-        for person in people:
-            x1, y1, x2, y2 = person.get_bbox_int()
-            
-            # Soft green - easier on the eyes during long monitoring
-            color = Colors.BOX_GREEN
-            
-            # Draw bounding box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            
-            # Draw label background
-            label = f"ID {person.track_id}"
-            (label_w, label_h), _ = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
-            )
-            cv2.rectangle(
-                frame,
-                (x1, y1 - label_h - 8),
-                (x1 + label_w + 8, y1),
-                color,
-                -1
-            )
-            
-            # Draw label text
-            cv2.putText(
-                frame,
-                label,
-                (x1 + 4, y1 - 4),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 0, 0),
-                1
-            )
-    
-    def _draw_header(self, frame: np.ndarray) -> None:
-        """
-        Draw the header bar.
-        
-        Layout:
-            [SCMS v1.0]                    [● LIVE] [Camera 01] [Time]
-        
-        Minimal vertical space. No large text.
-        """
-        height = 38
-        padding = 15
-        
-        # Background
-        cv2.rectangle(
-            frame,
-            (0, 0),
-            (self.frame_width, height),
-            Colors.HEADER,
-            -1
+        """Push a new backend snapshot. Thread-safe; latest-wins."""
+        snap = _Snapshot(
+            frame=frame,
+            people=list(people),
+            counter=counter or CounterState(),
+            occupancy=occupancy or OccupancyState(),
+            risk=risk or RiskState(),
+            alert=alert or AlertState(),
+            camera=camera or CameraHealth(),
+            perf=perf or PerformanceMetrics(),
         )
-        
-        # Accent line (Soft Orange - more premium)
-        cv2.line(
-            frame,
-            (0, height - 2),
-            (self.frame_width, height - 2),
-            Colors.ACCENT,
-            2
+        # drop stale snapshot if queue is full — UI only needs the latest
+        if self._queue.full():
+            try:
+                self._queue.get_nowait()
+            except Empty:
+                pass
+        self._queue.put_nowait(snap)
+
+    def run(self) -> None:
+        """Start the Tk main loop (blocks)."""
+        self.root.mainloop()
+
+    # ── Startup screen ──────────────────────────────────────────────────────
+
+    def _build_startup(self) -> None:
+        self._startup = tk.Frame(self.root, bg=BG)
+        self._startup.pack(expand=True, fill="both")
+
+        card = tk.Frame(self._startup, bg=PANEL, padx=40, pady=36)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(
+            card, text="SMART CROWD MANAGEMENT SYSTEM",
+            font=(FONT_FAMILY, 16, "bold"), fg=ACCENT, bg=PANEL,
+        ).grid(row=0, column=0, columnspan=2, pady=(0, 24), sticky="w")
+
+        tk.Label(card, text="VENUE NAME", font=F_LABEL, fg=TEXT_DIM, bg=PANEL)\
+            .grid(row=1, column=0, sticky="w", pady=(0, 4))
+        venue_var = tk.StringVar(value="Main Hall")
+        venue_entry = tk.Entry(
+            card, textvariable=venue_var, font=F_BODY, width=28,
+            bg=BG, fg=TEXT, insertbackground=TEXT, relief="flat",
+            highlightthickness=1, highlightbackground=GRAY, highlightcolor=ACCENT,
         )
-        
-        # System name (small, professional)
-        cv2.putText(
-            frame,
-            "SCMS v1.0",
-            (padding, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            Colors.TEXT_SECONDARY,
-            1
+        venue_entry.grid(row=2, column=0, columnspan=2, sticky="we", ipady=6, pady=(0, 18))
+
+        tk.Label(card, text="MAXIMUM CAPACITY", font=F_LABEL, fg=TEXT_DIM, bg=PANEL)\
+            .grid(row=3, column=0, sticky="w", pady=(0, 4))
+        cap_var = tk.StringVar(value="120")
+        cap_entry = tk.Entry(
+            card, textvariable=cap_var, font=F_BODY, width=28,
+            bg=BG, fg=TEXT, insertbackground=TEXT, relief="flat",
+            highlightthickness=1, highlightbackground=GRAY, highlightcolor=ACCENT,
         )
-        
-        # Right side elements
-        x_pos = self.frame_width - padding
-        
-        # Recording indicator (if active)
-        if self.recording:
-            cv2.circle(frame, (x_pos - 60, 20), 5, Colors.STATUS_ONLINE, -1)
-            cv2.putText(
-                frame,
-                "REC",
-                (x_pos - 48, 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                Colors.STATUS_ONLINE,
-                1
-            )
-            x_pos -= 80
-        
-        # Live indicator
-        cv2.circle(frame, (x_pos - 50, 20), 5, Colors.STATUS_ONLINE, -1)
-        cv2.putText(
-            frame,
-            "LIVE",
-            (x_pos - 38, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            Colors.TEXT_PRIMARY,
-            1
+        cap_entry.grid(row=4, column=0, columnspan=2, sticky="we", ipady=6, pady=(0, 22))
+
+        tk.Label(card, text="CAMERA", font=F_LABEL, fg=TEXT_DIM, bg=PANEL)\
+            .grid(row=5, column=0, sticky="w")
+        tk.Label(card, text="●  Connected", font=F_BODY, fg=GREEN, bg=PANEL)\
+            .grid(row=5, column=1, sticky="e")
+
+        tk.Label(card, text="RESOLUTION", font=F_LABEL, fg=TEXT_DIM, bg=PANEL)\
+            .grid(row=6, column=0, sticky="w", pady=(6, 22))
+        tk.Label(card, text="1280 × 720", font=F_BODY, fg=TEXT, bg=PANEL)\
+            .grid(row=6, column=1, sticky="e", pady=(6, 22))
+
+        start_btn = tk.Button(
+            card, text="START MONITORING",
+            font=(FONT_FAMILY, 11, "bold"),
+            bg=ACCENT, fg=BG, activebackground="#d98e1c", activeforeground=BG,
+            relief="flat", cursor="hand2", padx=20, pady=10, borderwidth=0,
+            command=lambda: self._start_monitoring(venue_var.get().strip(), cap_var.get().strip()),
         )
-        
-        # Camera name
-        cv2.putText(
-            frame,
-            self.camera_name,
-            (x_pos - 150, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            Colors.TEXT_SECONDARY,
-            1
-        )
-        
-        # Current time
-        current_time = datetime.now().strftime("%H:%M:%S")
-        cv2.putText(
-            frame,
-            current_time,
-            (x_pos - 220, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            Colors.TEXT_MUTED,
-            1
-        )
-    
-    def _draw_analytics_bar(
-        self,
-        frame: np.ndarray,
-        counter_state: CounterState,
-        occupancy_state: OccupancyState,
-        risk_state: RiskState
-    ) -> None:
-        """
-        Draw the analytics bar below the video feed.
-        
-        Layout (Value first, label below):
-            12        48%        12/25      NORMAL     30       00:12:35
-            People    Occupancy  Capacity   Risk       FPS      Duration
-        
-        Values are LARGE. Labels are small and below.
-        """
-        bar_height = 70
-        y_offset = self.frame_height - bar_height
-        padding = 30
-        
-        # Background
-        cv2.rectangle(
-            frame,
-            (0, y_offset),
-            (self.frame_width, self.frame_height),
-            Colors.BACKGROUND,
-            -1
-        )
-        
-        # Border line at top (Soft Orange accent)
-        cv2.line(
-            frame,
-            (0, y_offset),
-            (self.frame_width, y_offset),
-            Colors.ACCENT,
-            1
-        )
-        
-        # Calculate session duration
-        duration = datetime.now() - self.start_time
-        duration_str = str(duration).split('.')[0]  # HH:MM:SS
-        
-        # Metrics configuration
-        metrics = [
-            ("PEOPLE", str(counter_state.current_count), Colors.TEXT_PRIMARY),
-            ("OCCUPANCY", f"{occupancy_state.occupancy_percentage:.0f}%", Colors.TEXT_PRIMARY),
-            ("CAPACITY", f"{counter_state.current_count}/{occupancy_state.capacity}", Colors.TEXT_PRIMARY),
-            ("RISK", Colors.get_risk_text(risk_state.level), Colors.get_risk_color(risk_state.level)),
-            ("FPS", f"{self.fps:.0f}" if self.show_fps else "--", Colors.TEXT_MUTED),
-            ("DURATION", duration_str, Colors.TEXT_MUTED)
-        ]
-        
-        x_pos = padding
-        spacing = (self.frame_width - (padding * 2)) // len(metrics)
-        
-        for i, (label, value, color) in enumerate(metrics):
-            x = x_pos + (i * spacing)
-            
-            # Vertical separator (subtle)
-            if i > 0:
-                cv2.line(
-                    frame,
-                    (x - 10, y_offset + 8),
-                    (x - 10, y_offset + bar_height - 8),
-                    Colors.BORDER,
-                    1
-                )
-            
-            # Value (LARGE, primary)
-            font_scale = 1.0 if len(value) <= 4 else 0.8
-            cv2.putText(
-                frame,
-                value,
-                (x, y_offset + 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                font_scale,
-                color,
-                2
-            )
-            
-            # Label (small, below value)
-            cv2.putText(
-                frame,
-                label,
-                (x, y_offset + 58),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                Colors.TEXT_MUTED,
-                1
-            )
-    
-    def _draw_alert_panel(
-        self,
-        frame: np.ndarray,
-        alert_state: AlertState
-    ) -> None:
-        """
-        Draw the alert panel.
-        
-        Position: Above the analytics bar, right side
-        Only shows when there are active alerts.
-        """
-        if not alert_state.active_alerts:
+        start_btn.grid(row=7, column=0, columnspan=2, sticky="we")
+
+        self._startup_error = tk.Label(card, text="", font=F_LABEL, fg=RED, bg=PANEL)
+        self._startup_error.grid(row=8, column=0, columnspan=2, pady=(10, 0))
+
+        venue_entry.focus_set()
+
+    def _start_monitoring(self, venue: str, capacity_str: str) -> None:
+        if not venue:
+            self._startup_error.config(text="Venue name required.")
             return
-        
-        # Position: Top-right corner of the video feed
-        x_offset = self.frame_width - 320
-        y_offset = 55
-        width = 300
-        max_height = 160
-        
-        # Background
-        cv2.rectangle(
-            frame,
-            (x_offset, y_offset),
-            (x_offset + width, y_offset + max_height),
-            Colors.PANEL,
-            -1
-        )
-        
-        # Border
-        cv2.rectangle(
-            frame,
-            (x_offset, y_offset),
-            (x_offset + width, y_offset + max_height),
-            Colors.BORDER,
-            1
-        )
-        
-        # Soft Orange accent line at top
-        cv2.line(
-            frame,
-            (x_offset, y_offset),
-            (x_offset + width, y_offset),
-            Colors.ACCENT,
-            2
-        )
-        
-        # Header
-        cv2.putText(
-            frame,
-            "ALERTS",
-            (x_offset + 12, y_offset + 22),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            Colors.ACCENT,
-            1
-        )
-        
-        # Show alerts (top 3, newest first)
-        y = y_offset + 45
-        for alert in alert_state.active_alerts[:3]:
-            # Color based on severity
-            if alert.severity == "CRITICAL":
-                color = Colors.ALERT_CRITICAL
-            elif alert.severity == "HIGH":
-                color = Colors.ALERT_HIGH
-            elif alert.severity == "ELEVATED":
-                color = Colors.ALERT_WARNING
-            else:
-                color = Colors.ALERT_INFO
-            
-            # Alert icon
-            cv2.putText(
-                frame,
-                "⚠",
-                (x_offset + 12, y + 2),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                color,
-                1
-            )
-            
-            # Alert message (truncated)
-            msg = alert.message[:35]
-            cv2.putText(
-                frame,
-                msg,
-                (x_offset + 32, y + 4),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                Colors.TEXT_SECONDARY,
-                1
-            )
-            y += 26
-    
-    def _draw_watermark(self, frame: np.ndarray) -> None:
-        """
-        Draw small watermark.
-        
-        Position: Bottom-left corner
-        """
-        padding = 10
-        y_offset = self.frame_height - 12
-        
-        cv2.putText(
-            frame,
-            "SCMS v1.0",
-            (padding, y_offset),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.35,
-            Colors.TEXT_DIM,
-            1
-        )
-    
-    def _draw_system_status(self, frame: np.ndarray) -> None:
-        """
-        Draw system status indicators.
-        
-        Position: Bottom-right corner
-        Small, unobtrusive.
-        """
-        y_offset = self.frame_height - 12
-        x_offset = self.frame_width - 240
-        
-        statuses = [
-            ("Det", Colors.STATUS_ONLINE),
-            ("Trak", Colors.STATUS_ONLINE),
-            ("Cnt", Colors.STATUS_ONLINE),
-            ("Cam", Colors.STATUS_ONLINE)
-        ]
-        
-        x = x_offset
-        for name, color in statuses:
-            cv2.putText(
-                frame,
-                f"● {name}",
-                (x, y_offset),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.3,
-                color,
-                1
-            )
-            x += 65
-    
-    def _draw_frame_debug(self, frame: np.ndarray) -> None:
-        """
-        Draw frame number for debugging.
-        
-        Position: Bottom-center, very dim
-        Only shown if show_frame_number is True.
-        """
-        if not self.show_frame_number:
+        try:
+            capacity = int(capacity_str)
+            if capacity <= 0:
+                raise ValueError
+        except ValueError:
+            self._startup_error.config(text="Capacity must be a positive integer.")
             return
+
+        self.venue_name = venue
+        self.max_capacity = capacity
+        self._startup.destroy()
+        self._build_monitor()
+        self._monitoring = True
         
-        y_offset = self.frame_height - 12
-        text = f"Frame {self.frame_count}"
-        
-        cv2.putText(
-            frame,
-            text,
-            (self.frame_width // 2 - 40, y_offset),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.35,
-            Colors.TEXT_DIM,
-            1
+        print("1 Dashboard button pressed")
+
+        # Call the callback if set
+        if self._start_callback:
+            self._start_callback(venue, capacity)
+
+        self._tick_clock()
+        self._tick_pulse()
+        self._drain_queue()
+
+    # ── Monitoring screen ───────────────────────────────────────────────────
+
+    def _build_monitor(self) -> None:
+        root = self.root
+        root.configure(bg=BG)
+
+        # Row weights: header / body / metrics / alert
+        root.grid_rowconfigure(0, weight=0)
+        root.grid_rowconfigure(1, weight=1)
+        root.grid_rowconfigure(2, weight=0)
+        root.grid_rowconfigure(3, weight=0)
+        root.grid_columnconfigure(0, weight=1)
+
+        # ── Header ──
+        header = tk.Frame(root, bg=PANEL, height=56)
+        header.grid(row=0, column=0, sticky="we")
+        header.grid_propagate(False)
+        header.grid_columnconfigure(0, weight=1, uniform="h")
+        header.grid_columnconfigure(1, weight=1, uniform="h")
+        header.grid_columnconfigure(2, weight=1, uniform="h")
+
+        tk.Label(
+            header, text="SMART CROWD MANAGEMENT SYSTEM",
+            font=(FONT_FAMILY, 12, "bold"), fg=ACCENT, bg=PANEL,
+        ).grid(row=0, column=0, sticky="w", padx=20, pady=14)
+
+        tk.Label(
+            header, text=self.venue_name,
+            font=(FONT_FAMILY, 13, "bold"), fg=TEXT, bg=PANEL,
+        ).grid(row=0, column=1, pady=14)
+
+        right = tk.Frame(header, bg=PANEL)
+        right.grid(row=0, column=2, sticky="e", padx=20, pady=10)
+        self._clock_lbl = tk.Label(right, text="--:--:--", font=F_CLOCK, fg=TEXT, bg=PANEL)
+        self._clock_lbl.pack(side="left", padx=(0, 16))
+        self._live_dot = tk.Label(right, text="●", font=(FONT_FAMILY, 14), fg=RED, bg=PANEL)
+        self._live_dot.pack(side="left")
+        tk.Label(right, text="LIVE", font=(FONT_FAMILY, 10, "bold"),
+                 fg=TEXT, bg=PANEL).pack(side="left", padx=(4, 0))
+
+        # ── Body: status panel + camera feed ──
+        body = tk.Frame(root, bg=BG)
+        body.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        body.grid_rowconfigure(0, weight=1)
+        body.grid_columnconfigure(0, weight=0, minsize=220)
+        body.grid_columnconfigure(1, weight=1)
+
+        # Status panel
+        status = tk.Frame(body, bg=PANEL)
+        status.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        tk.Label(status, text="SYSTEM STATUS", font=F_SECTION,
+                 fg=ACCENT, bg=PANEL).pack(anchor="w", padx=16, pady=(14, 10))
+
+        self._status_lbls: dict[str, tk.Label] = {}
+        for key, label in [
+            ("camera",   "Camera"),
+            ("detector", "Detector"),
+            ("tracker",  "Tracker"),
+            ("logger",   "Logger"),
+        ]:
+            row = tk.Frame(status, bg=PANEL)
+            row.pack(fill="x", padx=16, pady=3)
+            dot = tk.Label(row, text="●", font=(FONT_FAMILY, 12), fg=GRAY, bg=PANEL)
+            dot.pack(side="left")
+            tk.Label(row, text="  " + label, font=F_BODY, fg=TEXT, bg=PANEL)\
+                .pack(side="left")
+            self._status_lbls[key] = dot
+
+        tk.Frame(status, bg=BG, height=1).pack(fill="x", padx=16, pady=14)
+
+        tk.Label(status, text="RESOLUTION", font=F_LABEL,
+                 fg=TEXT_DIM, bg=PANEL).pack(anchor="w", padx=16)
+        self._res_lbl = tk.Label(status, text="—", font=F_BODY, fg=TEXT, bg=PANEL)
+        self._res_lbl.pack(anchor="w", padx=16, pady=(0, 10))
+
+        tk.Label(status, text="FPS", font=F_LABEL,
+                 fg=TEXT_DIM, bg=PANEL).pack(anchor="w", padx=16)
+        self._status_fps_lbl = tk.Label(status, text="—", font=F_BODY, fg=TEXT, bg=PANEL)
+        self._status_fps_lbl.pack(anchor="w", padx=16, pady=(0, 10))
+
+        tk.Label(status, text="CAMERA QUALITY", font=F_LABEL,
+                 fg=TEXT_DIM, bg=PANEL).pack(anchor="w", padx=16)
+        self._quality_lbl = tk.Label(status, text="—", font=(FONT_FAMILY, 11, "bold"),
+                                     fg=TEXT, bg=PANEL)
+        self._quality_lbl.pack(anchor="w", padx=16, pady=(0, 16))
+
+        # Camera feed
+        feed = tk.Frame(body, bg=PANEL)
+        feed.grid(row=0, column=1, sticky="nsew")
+        self._video_lbl = tk.Label(feed, bg="#0e0e0e", text="WAITING FOR SIGNAL",
+                                   fg=TEXT_DIM, font=F_BODY)
+        self._video_lbl.pack(expand=True, fill="both", padx=2, pady=2)
+
+        # ── Metric cards ──
+        metrics = tk.Frame(root, bg=BG)
+        metrics.grid(row=2, column=0, sticky="we", padx=10, pady=(0, 10))
+        cards = ["PEOPLE", "OCCUPANCY", "CAPACITY", "RISK", "FPS", "CAMERA", "ALERTS"]
+        for i, _ in enumerate(cards):
+            metrics.grid_columnconfigure(i, weight=1, uniform="m")
+
+        self._metric_value: dict[str, tk.Label] = {}
+        for i, name in enumerate(cards):
+            card = tk.Frame(metrics, bg=PANEL)
+            card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 6, 0))
+            val = tk.Label(card, text="—", font=F_METRIC, fg=TEXT, bg=PANEL)
+            val.pack(pady=(14, 0))
+            tk.Label(card, text=name, font=F_LABEL, fg=TEXT_DIM, bg=PANEL)\
+                .pack(pady=(2, 14))
+            self._metric_value[name] = val
+
+        # ── Alert bar ──
+        self._alert_bar = tk.Frame(root, bg=GREEN, height=40)
+        self._alert_bar.grid(row=3, column=0, sticky="we")
+        self._alert_bar.grid_propagate(False)
+        self._alert_lbl = tk.Label(
+            self._alert_bar, text="STATUS: SYSTEM NORMAL",
+            font=(FONT_FAMILY, 11, "bold"), fg="#0d0d0d", bg=GREEN,
         )
-    
-    def set_recording(self, active: bool) -> None:
-        """
-        Set recording status.
-        
-        Args:
-            active: True if recording is active
-        """
-        self.recording = active
-    
-    def set_camera_name(self, name: str) -> None:
-        """
-        Set camera display name.
-        
-        Args:
-            name: Camera name
-        """
-        self.camera_name = name
-    
-    def reset_timer(self) -> None:
-        """
-        Reset the session timer.
-        
-        Useful when starting a new monitoring session.
-        """
-        self.start_time = datetime.now()
-    
-    def draw_zone_info(
-        self,
-        frame: np.ndarray,
-        zone_counts: dict
-    ) -> None:
-        """
-        Optional: Draw zone information if available.
-        
-        Args:
-            frame: Frame to draw on
-            zone_counts: Dictionary mapping zone names to counts
-        """
-        if not zone_counts:
+        self._alert_lbl.pack(side="left", padx=20, pady=8)
+
+    # ── Periodic UI tasks ───────────────────────────────────────────────────
+
+    def _tick_clock(self) -> None:
+        if not self._monitoring:
             return
-        
-        y_offset = 55
-        x_offset = 10
-        width = 120
-        height = len(zone_counts) * 28 + 30
-        
-        cv2.rectangle(
-            frame,
-            (x_offset, y_offset),
-            (x_offset + width, y_offset + height),
-            Colors.PANEL,
-            -1
+        self._clock_lbl.config(text=time.strftime("%H:%M:%S"))
+        self.root.after(1000, self._tick_clock)
+
+    def _tick_pulse(self) -> None:
+        if not self._monitoring:
+            return
+        self._pulse_on = not self._pulse_on
+        self._live_dot.config(fg=RED if self._pulse_on else PANEL)
+        self.root.after(700, self._tick_pulse)
+
+    def _drain_queue(self) -> None:
+        if not self._monitoring:
+            return
+        try:
+            while True:
+                self._latest = self._queue.get_nowait()
+        except Empty:
+            pass
+        self._render(self._latest)
+        self.root.after(33, self._drain_queue)
+
+    # ── Rendering ───────────────────────────────────────────────────────────
+
+    def _render(self, s: _Snapshot) -> None:
+        # Camera feed
+        self._render_frame(s.frame, s.people)
+
+        # Status panel dots
+        self._set_dot("camera",   GREEN if s.camera.online else RED)
+        self._set_dot("detector", GREEN if s.perf.detector_ready else GRAY)
+        self._set_dot("tracker",  GREEN if s.perf.tracker_ready else GRAY)
+        self._set_dot("logger",   GREEN if s.perf.logger_active else GRAY)
+
+        w, h = s.camera.resolution if s.camera.resolution else (0, 0)
+        self._res_lbl.config(text=f"{w}×{h}" if w and h else "—")
+        self._status_fps_lbl.config(text=f"{s.perf.fps:.0f}" if s.perf.fps else "—")
+
+        q_color = {"GOOD": GREEN, "BLUR": AMBER, "OFFLINE": RED}.get(s.camera.quality, TEXT)
+        self._quality_lbl.config(text=s.camera.quality, fg=q_color)
+
+        # Metric cards
+        self._metric_value["PEOPLE"].config(text=str(s.counter.people), fg=TEXT)
+        pct = int(round(s.occupancy.percent))
+        self._metric_value["OCCUPANCY"].config(text=f"{pct}%", fg=TEXT)
+        cap = s.occupancy.capacity or self.max_capacity
+        self._metric_value["CAPACITY"].config(text=f"{s.occupancy.current}/{cap}", fg=TEXT)
+
+        risk_color = {"NORMAL": GREEN, "HIGH": AMBER, "CRITICAL": RED}.get(s.risk.level, TEXT)
+        self._metric_value["RISK"].config(text=s.risk.level, fg=risk_color)
+
+        self._metric_value["FPS"].config(text=f"{s.perf.fps:.0f}" if s.perf.fps else "—", fg=TEXT)
+        self._metric_value["CAMERA"].config(text=s.camera.quality, fg=q_color)
+        self._metric_value["ALERTS"].config(
+            text=f"{s.alert.active}",
+            fg=AMBER if s.alert.active else TEXT,
         )
-        cv2.rectangle(
-            frame,
-            (x_offset, y_offset),
-            (x_offset + width, y_offset + height),
-            Colors.BORDER,
-            1
-        )
-        
-        # Soft Orange accent line at top
-        cv2.line(
-            frame,
-            (x_offset, y_offset),
-            (x_offset + width, y_offset),
-            Colors.ACCENT,
-            2
-        )
-        
-        y = y_offset + 25
-        for zone_name, count in zone_counts.items():
-            cv2.putText(
-                frame,
-                f"{zone_name}: {count}",
-                (x_offset + 10, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                Colors.TEXT_SECONDARY,
-                1
-            )
-            y += 28
+
+        # Alert bar
+        self._render_alert(s.alert)
+
+    def _set_dot(self, key: str, color: str) -> None:
+        self._status_lbls[key].config(fg=color)
+
+    def _render_alert(self, a: AlertState) -> None:
+        sev = (a.severity or "NORMAL").upper()
+        if sev == "CRITICAL":
+            bg, fg = RED, "#ffffff"
+            text = f"CRITICAL: {a.message or 'Maximum Capacity Exceeded'}"
+        elif sev in ("WARNING", "HIGH"):
+            bg, fg = AMBER, "#0d0d0d"
+            text = f"WARNING: {a.message or 'High Occupancy Detected'}"
+        else:
+            bg, fg = GREEN, "#0d0d0d"
+            text = "STATUS: SYSTEM NORMAL"
+        self._alert_bar.config(bg=bg)
+        self._alert_lbl.config(bg=bg, fg=fg, text=text)
+
+    # ── Frame drawing ───────────────────────────────────────────────────────
+
+    def _render_frame(self, frame, people: Sequence[Person]) -> None:
+        if frame is None or cv2 is None or Image is None:
+            return
+
+        try:
+            frame_array = np.asarray(frame)
+        except Exception:
+            return
+
+        if frame_array.ndim != 3 or frame_array.shape[2] != 3:
+            return
+
+        img = frame_array.copy()
+        for p in people:
+            try:
+                x1, y1, x2, y2 = (int(v) for v in p.bbox)
+            except Exception:
+                continue
+            cv2.rectangle(img, (x1, y1), (x2, y2), (35, 166, 245), 2)
+            label = f"#{p.track_id}"
+            if getattr(p, "confidence", 0):
+                label += f"  {p.confidence:.2f}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            cv2.rectangle(img, (x1, y1 - th - 8), (x1 + tw + 8, y1), (35, 166, 245), -1)
+            cv2.putText(img, label, (x1 + 4, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (24, 24, 24), 1, cv2.LINE_AA)
+
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        self._photo = ImageTk.PhotoImage(image=Image.fromarray(rgb))
+        self._photo_refs.append(self._photo)
+        if len(self._photo_refs) > 3:
+            self._photo_refs.pop(0)
+        self._video_lbl.config(image=self._photo, text="")
+        self._video_lbl.image = self._photo
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Manual smoke test
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    Dashboard().run()
