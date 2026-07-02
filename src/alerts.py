@@ -16,11 +16,27 @@ Architecture:
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import List, Optional, Dict, Set
+from typing import List, Optional, Dict, Set, Any
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+# Optional audio library – fallback if not installed
+try:
+    import pygame
+    pygame.mixer.init()
+    AUDIO_AVAILABLE = True
+except ImportError:
+    AUDIO_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "pygame not installed – alarm audio disabled"
+    )
 
 from .risk import RiskState, RiskLevel, RiskFactor
 
@@ -214,6 +230,26 @@ class Alerts:
         self.state = AlertState()
         self.previous_risk_level: Optional[RiskLevel] = None
         
+        # Assets path for alarm sound
+        self.assets_path = Path("assets")
+        self.alarm_sound_path = self.assets_path / "alarm.wav"
+        self._alarm_sound = None
+        if AUDIO_AVAILABLE and self.alarm_sound_path.exists():
+            try:
+                self._alarm_sound = pygame.mixer.Sound(str(self.alarm_sound_path))
+                logger.info("Alarm sound loaded successfully")
+            except Exception as e:
+                logger.warning(f"Failed to load alarm sound: {e}")
+        else:
+            if not AUDIO_AVAILABLE:
+                logger.warning("pygame not available – alarm disabled")
+            elif not self.alarm_sound_path.exists():
+                logger.warning(f"Alarm sound not found at {self.alarm_sound_path} – alarm disabled")
+        
+        # Evidence folder
+        self.evidence_folder = Path("alerts")
+        self._ensure_evidence_folder()
+        
         logger.info(
             f"Alert Engine initialized: cooldown={cooldown_frames} frames, "
             f"max_history={max_history}"
@@ -223,7 +259,7 @@ class Alerts:
     # Public Interface
     # ========================================================================
     
-    def update(self, risk_state: RiskState) -> AlertState:
+    def update(self, risk_state: RiskState, frame: Optional[np.ndarray] = None) -> AlertState:
         """
         Update alert state with new risk assessment.
         
@@ -240,6 +276,7 @@ class Alerts:
         
         Args:
             risk_state: RiskState from Risk module
+            frame: Optional current video frame for evidence capture
             
         Returns:
             AlertState containing current alert state
@@ -256,12 +293,13 @@ class Alerts:
             
             # Stage 4: Duplicate suppression (cooldown check)
             if self._can_create_alert(alert_type):
-                # Stage 5: Update lifecycle
+                # Stage 5: Update lifecycle, pass frame to action handler
                 self._create_or_update_alert(
                     alert_type=alert_type,
                     level=alert_level,
                     message=message,
-                    risk_state=risk_state
+                    risk_state=risk_state,
+                    frame=frame
                 )
             else:
                 # Alert is in cooldown, keep existing if any
@@ -404,7 +442,8 @@ class Alerts:
         alert_type: AlertType,
         level: AlertLevel,
         message: str,
-        risk_state: RiskState
+        risk_state: RiskState,
+        frame: Optional[np.ndarray] = None
     ) -> None:
         """
         Stage 4: Create a new alert or update existing one.
@@ -414,6 +453,7 @@ class Alerts:
             level: Alert urgency level
             message: Alert message
             risk_state: Current risk state
+            frame: Optional frame for evidence capture (only used on new alert)
         """
         if alert_type in self.active_alerts:
             # Update existing alert
@@ -437,11 +477,16 @@ class Alerts:
                 risk_level=risk_state.level,
                 metadata={
                     'created_occupancy': risk_state.occupancy_percentage,
-                    'created_status': risk_state.status.value
+                    'created_status': risk_state.status.value,
+                    'alarm_triggered': False,   # track alarm state
+                    'evidence_saved': False     # track evidence state
                 }
             )
             self.active_alerts[alert_type] = alert
             logger.info(f"Created alert: {alert_type.value} ({level.value})")
+            
+            # Execute alert actions (alarm, screenshot, etc.)
+            self._handle_new_alert(alert, risk_state, frame)
     
     def _resolve_alerts(self, risk_state: RiskState) -> None:
         """
@@ -514,6 +559,107 @@ class Alerts:
             timestamp=datetime.now()
         )
     
+    # ========================================================================
+    # Alert Actions (New)
+    # ========================================================================
+    
+    def _handle_new_alert(self, alert: Alert, risk_state: RiskState, frame: Optional[np.ndarray]) -> None:
+        """
+        Central action handler for a newly created alert.
+        This method is called only once per alert instance.
+        
+        Current actions:
+            - Play alarm sound (if CRITICAL)
+            - Save evidence screenshot (if CRITICAL)
+        
+        Future actions can be added here without changing core logic.
+        
+        Args:
+            alert: The newly created Alert object
+            risk_state: Current risk state
+            frame: Optional current frame for evidence
+        """
+        # 1. Alarm – only for CRITICAL alerts
+        if alert.level == AlertLevel.CRITICAL:
+            self._play_alarm(alert)
+        
+        # 2. Evidence capture – only for CRITICAL alerts and if frame is provided
+        if alert.level == AlertLevel.CRITICAL and frame is not None:
+            self._save_evidence(frame, alert)
+        
+        # 3. Future notification hooks can be added here:
+        # self._send_email(alert)   # placeholder
+        # self._send_sms(alert)     # placeholder
+        # self._firebase_push(alert) # placeholder
+
+    def _play_alarm(self, alert: Alert) -> None:
+        """
+        Play the alarm sound once for a new CRITICAL alert.
+        Uses pygame.mixer if available; otherwise logs a warning and does nothing.
+        
+        The 'alarm_triggered' flag in alert.metadata prevents replay.
+        
+        Args:
+            alert: The alert for which to play the alarm
+        """
+        # Check if already triggered (should not happen for new alert, but safe)
+        if alert.metadata.get('alarm_triggered', False):
+            logger.debug("Alarm already triggered for this alert – skipping")
+            return
+        
+        if self._alarm_sound is not None:
+            try:
+                self._alarm_sound.play()
+                alert.metadata['alarm_triggered'] = True
+                logger.info(f"Alarm played for alert {alert.alert_id}")
+            except Exception as e:
+                logger.error(f"Failed to play alarm: {e}")
+        else:
+            logger.warning("Alarm sound not available – skipping audio")
+
+    def _save_evidence(self, frame: np.ndarray, alert: Alert) -> None:
+        """
+        Save the current frame as evidence for a new CRITICAL alert.
+        
+        Creates the 'alerts/' folder if it doesn't exist.
+        Filename format: YYYY-MM-DD_HH-MM-SS.jpg (using alert creation time).
+        
+        Only saves if 'evidence_saved' is False in alert.metadata.
+        
+        Args:
+            frame: BGR image (numpy array)
+            alert: The alert for which to save evidence
+        """
+        if alert.metadata.get('evidence_saved', False):
+            logger.debug("Evidence already saved for this alert – skipping")
+            return
+        
+        try:
+            # Ensure folder exists
+            self._ensure_evidence_folder()
+            
+            # Build filename from alert creation time
+            timestamp = alert.created_at.strftime("%Y-%m-%d_%H-%M-%S")
+            filename = self.evidence_folder / f"{timestamp}.jpg"
+            
+            # Save frame as JPEG
+            success = cv2.imwrite(str(filename), frame)
+            if success:
+                alert.metadata['evidence_saved'] = True
+                alert.metadata['evidence_path'] = str(filename)
+                logger.info(f"Evidence saved: {filename}")
+            else:
+                logger.error(f"Failed to save evidence: {filename}")
+        except Exception as e:
+            logger.error(f"Error saving evidence: {e}")
+    
+    def _ensure_evidence_folder(self) -> None:
+        """Create the evidence folder if it doesn't exist."""
+        try:
+            self.evidence_folder.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Failed to create evidence folder: {e}")
+
     # ========================================================================
     # Public Methods
     # ========================================================================

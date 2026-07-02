@@ -569,7 +569,10 @@ class Application:
             )
             
             # 5. Alerts
-            alert_state = self.modules['alerts'].update(risk_state)
+            alert_state = self.modules["alerts"].update(
+                risk_state,
+                frame=frame
+                )
             
             # 6. Logger
             fps = self.state.fps_instant
