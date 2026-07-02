@@ -36,7 +36,6 @@ import time
 import tkinter as tk
 from dataclasses import dataclass, field
 from queue import Empty, Queue
-from tkinter import ttk
 from typing import Iterable, Optional, Sequence
 
 import numpy as np
@@ -65,6 +64,7 @@ TEXT_DIM    = "#8A8A8A"
 GREEN       = "#3FB950"
 AMBER       = "#F5A623"
 RED         = "#E5484D"
+DARK_RED    = "#8B0000"   # for flashing
 GRAY        = "#5A5A5A"
 
 FONT_FAMILY = "Helvetica"
@@ -154,6 +154,14 @@ class Dashboard:
         self._photo = None              # keep ref so Tk doesn't GC the image
         self._photo_refs = []          # retain recent PhotoImage objects
         self._pulse_on = True
+
+        # Flashing state
+        self._flash_active = False
+        self._flash_state = False      # True = bright, False = dark
+        self._last_severity = None     # for detecting change
+        # Store original colours for restoration
+        self._original_risk_fg = TEXT
+        self._original_alerts_fg = TEXT
 
         self.root = tk.Tk()
         self.root.title("Smart Crowd Management System")
@@ -338,7 +346,7 @@ class Dashboard:
         body.grid_columnconfigure(0, weight=0, minsize=220)
         body.grid_columnconfigure(1, weight=1)
 
-        # Status panel
+        # Status panel (left)
         status = tk.Frame(body, bg=PANEL)
         status.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         tk.Label(status, text="SYSTEM STATUS", font=F_SECTION,
@@ -377,12 +385,34 @@ class Dashboard:
                                      fg=TEXT, bg=PANEL)
         self._quality_lbl.pack(anchor="w", padx=16, pady=(0, 16))
 
-        # Camera feed
+        # ── Camera feed (right) ──
         feed = tk.Frame(body, bg=PANEL)
         feed.grid(row=0, column=1, sticky="nsew")
+        feed.grid_rowconfigure(1, weight=1)   # video label expands
+        feed.grid_columnconfigure(0, weight=1)
+
+        # Alert strip (row 0)
+        self.alert_strip_frame = tk.Frame(feed, bg=PANEL, height=30)
+        self.alert_strip_frame.grid(row=0, column=0, sticky="ew")
+        self.alert_strip_frame.grid_propagate(False)   # fixed height
+        # Initially hidden
+        self.alert_strip_frame.grid_remove()
+
+        self.alert_strip_label = tk.Label(
+            self.alert_strip_frame,
+            text="",
+            font=(FONT_FAMILY, 11, "bold"),
+            fg="white",
+            bg=PANEL,
+            anchor="w",
+            padx=10,
+        )
+        self.alert_strip_label.pack(fill="both", expand=True)
+
+        # Video label (row 1)
         self._video_lbl = tk.Label(feed, bg="#0e0e0e", text="WAITING FOR SIGNAL",
                                    fg=TEXT_DIM, font=F_BODY)
-        self._video_lbl.pack(expand=True, fill="both", padx=2, pady=2)
+        self._video_lbl.grid(row=1, column=0, sticky="nsew", padx=2, pady=(0, 2))
 
         # ── Metric cards ──
         metrics = tk.Frame(root, bg=BG)
@@ -464,16 +494,20 @@ class Dashboard:
         self._metric_value["CAPACITY"].config(text=f"{s.occupancy.current}/{cap}", fg=TEXT)
 
         risk_color = {"NORMAL": GREEN, "HIGH": AMBER, "CRITICAL": RED}.get(s.risk.level, TEXT)
-        self._metric_value["RISK"].config(text=s.risk.level, fg=risk_color)
+        # Only set if not flashing (flashing will override)
+        if not self._flash_active:
+            self._metric_value["RISK"].config(text=s.risk.level, fg=risk_color)
+            # Also store the original for restoration
+            self._original_risk_fg = risk_color
 
         self._metric_value["FPS"].config(text=f"{s.perf.fps:.0f}" if s.perf.fps else "—", fg=TEXT)
         self._metric_value["CAMERA"].config(text=s.camera.quality, fg=q_color)
-        self._metric_value["ALERTS"].config(
-            text=f"{s.alert.active}",
-            fg=AMBER if s.alert.active else TEXT,
-        )
+        alerts_fg = AMBER if s.alert.active else TEXT
+        if not self._flash_active:
+            self._metric_value["ALERTS"].config(text=f"{s.alert.active}", fg=alerts_fg)
+            self._original_alerts_fg = alerts_fg
 
-        # Alert bar
+        # Alert bar and strip
         self._render_alert(s.alert)
 
     def _set_dot(self, key: str, color: str) -> None:
@@ -481,6 +515,8 @@ class Dashboard:
 
     def _render_alert(self, a: AlertState) -> None:
         sev = (a.severity or "NORMAL").upper()
+
+        # --- Alert bar (bottom) ---
         if sev == "CRITICAL":
             bg, fg = RED, "#ffffff"
             text = f"CRITICAL: {a.message or 'Maximum Capacity Exceeded'}"
@@ -492,6 +528,74 @@ class Dashboard:
             text = "STATUS: SYSTEM NORMAL"
         self._alert_bar.config(bg=bg)
         self._alert_lbl.config(bg=bg, fg=fg, text=text)
+
+        # --- Alert strip (above camera) and flashing ---
+        # Detect severity change
+        if sev != self._last_severity:
+            if sev == "CRITICAL":
+                # Show strip
+                strip_text = f"🚨 CRITICAL ALERT • {a.message or 'MAXIMUM OCCUPANCY EXCEEDED'}"
+                self.alert_strip_label.config(text=strip_text)
+                self.alert_strip_frame.grid()   # make visible
+                # Start flashing
+                self._start_flashing()
+                # Update window title
+                self.root.title("🚨 Smart Crowd Management System - CRITICAL ALERT")
+            else:
+                # Hide strip
+                self.alert_strip_frame.grid_remove()
+                # Stop flashing
+                self._stop_flashing()
+                # Restore window title
+                self.root.title("Smart Crowd Management System")
+            self._last_severity = sev
+
+        # If already critical, we just keep flashing; no change needed.
+
+    # ── Flashing controls ──────────────────────────────────────────────────
+
+    def _start_flashing(self) -> None:
+        if self._flash_active:
+            return
+        # Save current colours before flashing (they are already set in _render)
+        # We'll use the stored original values.
+        self._flash_active = True
+        self._flash_state = False   # start with dark
+        self._flash_toggle()
+
+    def _stop_flashing(self) -> None:
+        self._flash_active = False
+        # Restore original colours
+        self._metric_value["RISK"].config(fg=self._original_risk_fg)
+        self._metric_value["ALERTS"].config(fg=self._original_alerts_fg)
+        # Restore strip background to panel (though hidden, but keep clean)
+        self.alert_strip_frame.config(bg=PANEL)
+        self.alert_strip_label.config(bg=PANEL)
+
+    def _flash_toggle(self) -> None:
+        if not self._flash_active:
+            return
+        self._flash_state = not self._flash_state
+        self._apply_flash_state(self._flash_state)
+        # Schedule next toggle in 500 ms
+        self.root.after(500, self._flash_toggle)
+
+    def _apply_flash_state(self, state: bool) -> None:
+        """Apply bright or dark colours based on state."""
+        if state:
+            strip_bg = RED
+            metric_fg = RED
+        else:
+            strip_bg = DARK_RED
+            metric_fg = DARK_RED
+
+        # Alert strip
+        self.alert_strip_frame.config(bg=strip_bg)
+        self.alert_strip_label.config(bg=strip_bg)
+
+        # Risk and Alerts cards
+        self._metric_value["RISK"].config(fg=metric_fg)
+        self._metric_value["ALERTS"].config(fg=metric_fg)
 
     # ── Frame drawing ───────────────────────────────────────────────────────
 
